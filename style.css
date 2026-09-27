@@ -1,0 +1,30 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #05060f;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+#game {
+  display: block;
+  /* 画面に収まる最大サイズで 2:3 の比率を保つ */
+  height: min(100vh, 150vw);
+  width: auto;
+  aspect-ratio: 2 / 3;
+  background: #000;
+  box-shadow: 0 0 40px rgba(80, 120, 255, 0.25);
+  touch-action: none;
+  image-rendering: pixelated;
+}
