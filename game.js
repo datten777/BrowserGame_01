@@ -15,7 +15,7 @@ const HIGH_SCORE_KEY = 'starBlaster.highScore';
 // 入力
 // ------------------------------------------------------------
 const keys = new Set();
-const pointer = { active: false, x: 0, y: 0 };
+const pointer = { active: false, id: null, x: 0, y: 0 };
 
 window.addEventListener('keydown', (e) => {
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
@@ -25,6 +25,9 @@ window.addEventListener('keydown', (e) => {
 
   if (e.key === 'Enter' || e.key === ' ') {
     if (game.state === 'title' || game.state === 'gameover') startGame();
+  }
+  if ((e.key.toLowerCase() === 'x' || e.key.toLowerCase() === 'b') && !e.repeat) {
+    useBomb();
   }
   if (e.key.toLowerCase() === 'p' && (game.state === 'playing' || game.state === 'paused')) {
     game.state = game.state === 'playing' ? 'paused' : 'playing';
@@ -50,19 +53,30 @@ canvas.addEventListener('pointerdown', (e) => {
     startGame();
     return;
   }
-  if (game.state === 'paused') game.state = 'playing';
+  if (game.state === 'paused') {
+    game.state = 'playing';
+    return;
+  }
   const p = toCanvasCoords(e);
+  if (hit({ x: p.x, y: p.y, r: 0 }, BOMB_BUTTON)) {
+    useBomb();
+    return;
+  }
   pointer.active = true;
+  pointer.id = e.pointerId;
   pointer.x = p.x;
   pointer.y = p.y;
 });
 canvas.addEventListener('pointermove', (e) => {
-  if (!pointer.active) return;
+  if (!pointer.active || e.pointerId !== pointer.id) return;
   const p = toCanvasCoords(e);
   pointer.x = p.x;
   pointer.y = p.y;
 });
-const endPointer = () => { pointer.active = false; };
+// ボムボタンを押した指を離しても、移動中の指の操作は続ける
+const endPointer = (e) => {
+  if (e.pointerId === pointer.id) pointer.active = false;
+};
 canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 
@@ -95,6 +109,126 @@ function saveHighScore(v) {
 }
 
 // ------------------------------------------------------------
+// 武器・ボム
+// ------------------------------------------------------------
+const MAX_LEVEL = 3;
+const START_BOMBS = 3;
+const MAX_BOMBS = 5;
+const BOMB_DAMAGE = 10;
+const BOMB_BUTTON = { x: W - 48, y: H - 56, r: 32 };
+
+// 武器アイテムを取ると持ち替え。同じ武器を取るとレベルアップ(最大3)
+const WEAPONS = {
+  normal: { name: 'VULCAN', letter: 'V', color: '#fff6a0', cooldown: 0.1 },
+  spread: { name: 'SPREAD', letter: 'S', color: '#ff9f43', cooldown: 0.16 },
+  laser: { name: 'LASER', letter: 'L', color: '#5ee7ff', cooldown: 0.06 },
+  homing: { name: 'HOMING', letter: 'H', color: '#d08bff', cooldown: 0.24 },
+  wave: { name: 'WAVE', letter: 'W', color: '#7fffb2', cooldown: 0.13 },
+};
+const WEAPON_IDS = Object.keys(WEAPONS);
+
+function addBullet(b) {
+  game.bullets.push({ r: 4, dmg: 1, age: 0, ...b });
+}
+
+function fireWeapon(p) {
+  const lv = p.level;
+  const x = p.x;
+  const y = p.y - 16;
+  switch (p.weapon) {
+    case 'normal': {
+      // 平行に並ぶ連射弾。レベルで本数が増える
+      const offsets = [[0], [-6, 6], [-10, 0, 10]][lv - 1];
+      for (const o of offsets) addBullet({ kind: 'normal', x: x + o, y, vx: 0, vy: -650 });
+      break;
+    }
+    case 'spread': {
+      // 扇状に広がる弾。レベルで 3 / 5 / 7 方向
+      const ways = lv * 2 + 1;
+      for (let i = 0; i < ways; i++) {
+        const a = (i - (ways - 1) / 2) * 0.16;
+        addBullet({ kind: 'spread', x, y, vx: Math.sin(a) * 560, vy: -Math.cos(a) * 560 });
+      }
+      break;
+    }
+    case 'laser': {
+      // 敵を貫通する細いビーム。レベルで威力アップ
+      addBullet({ kind: 'laser', x, y, vx: 0, vy: -950, r: 5, dmg: 0.4 + lv * 0.2, pierce: true, hitIds: new Set() });
+      break;
+    }
+    case 'homing': {
+      // 近くの敵を追いかけるミサイル。レベルで 2 / 3 / 4 発
+      const count = lv + 1;
+      for (let i = 0; i < count; i++) {
+        const a = -Math.PI / 2 + (i - (count - 1) / 2) * 0.6;
+        addBullet({ kind: 'homing', x, y, vx: Math.cos(a) * 320, vy: Math.sin(a) * 320, r: 5, dmg: 1.5 });
+      }
+      break;
+    }
+    case 'wave': {
+      // 左右にうねりながら進む大きめの弾。レベルで本数が増える
+      const phases = [[0], [0, Math.PI], [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3]][lv - 1];
+      for (const phase of phases) {
+        addBullet({ kind: 'wave', x, y, baseX: x, vx: 0, vy: -480, r: 7, phase });
+      }
+      break;
+    }
+  }
+}
+
+function updateBullets(dt) {
+  for (const b of game.bullets) {
+    b.age += dt;
+    if (b.kind === 'homing') {
+      // 一番近い敵へ少しずつ向きを変える
+      let target = null;
+      let best = Infinity;
+      for (const e of game.enemies) {
+        const d = (e.x - b.x) ** 2 + (e.y - b.y) ** 2;
+        if (e.hp > 0 && d < best) {
+          best = d;
+          target = e;
+        }
+      }
+      const speed = 420;
+      let angle = Math.atan2(b.vy, b.vx);
+      if (target) {
+        const want = Math.atan2(target.y - b.y, target.x - b.x);
+        let diff = want - angle;
+        diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+        angle += clamp(diff, -6 * dt, 6 * dt);
+      }
+      b.vx = Math.cos(angle) * speed;
+      b.vy = Math.sin(angle) * speed;
+    }
+    if (b.kind === 'wave') {
+      b.y += b.vy * dt;
+      b.x = b.baseX + Math.sin(b.age * 12 + b.phase) * 40;
+    } else {
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+    }
+  }
+}
+
+function useBomb() {
+  const p = game.player;
+  if (game.state !== 'playing' || p.bombs <= 0 || game.bombFx > 0) return;
+  p.bombs -= 1;
+  p.invincible = Math.max(p.invincible, 1.5);
+  game.bombFx = 0.8;
+  game.bombOrigin = { x: p.x, y: p.y };
+  game.shake = 0.5;
+  // 敵弾はすべて消える
+  for (const b of game.enemyBullets) explode(b.x, b.y, '#ff6b9a', 3);
+  game.enemyBullets = [];
+  // 画面内の敵全員にダメージ
+  for (const e of game.enemies) {
+    if (e.y > -e.r) damageEnemy(e, BOMB_DAMAGE);
+  }
+}
+
+// ------------------------------------------------------------
 // ゲーム状態
 // ------------------------------------------------------------
 const game = {
@@ -104,12 +238,14 @@ const game = {
   time: 0,
   spawnTimer: 0,
   shake: 0,
+  bombFx: 0, // ボム演出の残り時間(秒)
+  bombOrigin: { x: 0, y: 0 },
   player: null,
   bullets: [],
   enemyBullets: [],
   enemies: [],
   particles: [],
-  powerUps: [],
+  items: [],
   stars: [],
 };
 
@@ -126,7 +262,9 @@ function createPlayer() {
     lives: 3,
     fireCooldown: 0,
     invincible: 2,
-    power: 0, // パワーアップ残り時間(秒)
+    weapon: 'normal',
+    level: 1,
+    bombs: START_BOMBS,
   };
 }
 
@@ -136,12 +274,13 @@ function startGame() {
   game.time = 0;
   game.spawnTimer = 1;
   game.shake = 0;
+  game.bombFx = 0;
   game.player = createPlayer();
   game.bullets = [];
   game.enemyBullets = [];
   game.enemies = [];
   game.particles = [];
-  game.powerUps = [];
+  game.items = [];
 }
 
 // 経過時間に応じて難易度を上げる
@@ -249,23 +388,13 @@ function updatePlayer(dt) {
   p.y = clamp(p.y, p.r + 40, H - p.r);
 
   p.invincible = Math.max(0, p.invincible - dt);
-  p.power = Math.max(0, p.power - dt);
   p.fireCooldown -= dt;
 
   // スペース / Z / タッチ中は連射
   const firing = keys.has(' ') || keys.has('z') || pointer.active;
   if (firing && p.fireCooldown <= 0) {
-    p.fireCooldown = 0.12;
-    const spread = p.power > 0 ? [-0.18, 0, 0.18] : [0];
-    for (const a of spread) {
-      game.bullets.push({
-        x: p.x,
-        y: p.y - 16,
-        vx: Math.sin(a) * 600,
-        vy: -Math.cos(a) * 600,
-        r: 4,
-      });
-    }
+    p.fireCooldown = WEAPONS[p.weapon].cooldown;
+    fireWeapon(p);
   }
 }
 
@@ -274,7 +403,9 @@ function damagePlayer() {
   if (p.invincible > 0) return;
   p.lives -= 1;
   p.invincible = 2;
-  p.power = 0;
+  // やられると武器レベルが 1 下がり、ボムは初期数まで補充
+  p.level = Math.max(1, p.level - 1);
+  p.bombs = Math.max(p.bombs, START_BOMBS);
   game.shake = 0.4;
   explode(p.x, p.y, '#6cf', 30);
   if (p.lives <= 0) {
@@ -317,19 +448,48 @@ function updateParticles(dt) {
   game.particles = game.particles.filter((pt) => pt.life > 0);
 }
 
-function updatePowerUps(dt) {
+const BOMB_ITEM_COLOR = '#ff5470';
+
+function dropItem(x, y) {
+  // 5回に1回はボム、それ以外はランダムな武器
+  const kind = Math.random() < 0.2 ? 'bomb' : WEAPON_IDS[Math.floor(Math.random() * WEAPON_IDS.length)];
+  game.items.push({ kind, x, y, r: 11, age: 0 });
+}
+
+function updateItems(dt) {
   const p = game.player;
-  for (const u of game.powerUps) {
+  for (const u of game.items) {
     u.y += 90 * dt;
     u.age += dt;
     if (hit(u, p)) {
       u.taken = true;
-      p.power = 8;
       game.score += 50;
-      explode(u.x, u.y, '#7fffb2', 12);
+      if (u.kind === 'bomb') {
+        p.bombs = Math.min(MAX_BOMBS, p.bombs + 1);
+        explode(u.x, u.y, BOMB_ITEM_COLOR, 12);
+      } else {
+        if (u.kind === p.weapon) {
+          p.level = Math.min(MAX_LEVEL, p.level + 1);
+        } else {
+          p.weapon = u.kind;
+        }
+        explode(u.x, u.y, WEAPONS[u.kind].color, 12);
+      }
     }
   }
-  game.powerUps = game.powerUps.filter((u) => !u.taken && u.y < H + 20);
+  game.items = game.items.filter((u) => !u.taken && u.y < H + 20);
+}
+
+function damageEnemy(e, dmg) {
+  if (e.hp <= 0) return;
+  e.hp -= dmg;
+  e.flash = 0.08;
+  if (e.hp <= 0) {
+    const def = ENEMY_TYPES[e.type];
+    game.score += def.score;
+    explode(e.x, e.y, def.color, e.type === 'gunner' ? 30 : 16);
+    if (Math.random() < (e.type === 'gunner' ? 0.6 : 0.08)) dropItem(e.x, e.y);
+  }
 }
 
 // ------------------------------------------------------------
@@ -349,6 +509,7 @@ function update(dt) {
 
   game.time += dt;
   game.shake = Math.max(0, game.shake - dt);
+  game.bombFx = Math.max(0, game.bombFx - dt);
 
   game.spawnTimer -= dt;
   if (game.spawnTimer <= 0) {
@@ -359,10 +520,7 @@ function update(dt) {
   updatePlayer(dt);
   updateEnemies(dt);
 
-  for (const b of game.bullets) {
-    b.x += b.vx * dt;
-    b.y += b.vy * dt;
-  }
+  updateBullets(dt);
   for (const b of game.enemyBullets) {
     b.x += b.vx * dt;
     b.y += b.vy * dt;
@@ -371,18 +529,15 @@ function update(dt) {
   // 自機弾 × 敵
   for (const b of game.bullets) {
     for (const e of game.enemies) {
-      if (e.hp > 0 && hit(b, e)) {
+      if (e.hp <= 0 || !hit(b, e)) continue;
+      if (b.pierce) {
+        // 貫通弾は同じ敵に一度だけ当たる
+        if (b.hitIds.has(e)) continue;
+        b.hitIds.add(e);
+        damageEnemy(e, b.dmg);
+      } else {
         b.dead = true;
-        e.hp -= 1;
-        e.flash = 0.08;
-        if (e.hp <= 0) {
-          const def = ENEMY_TYPES[e.type];
-          game.score += def.score;
-          explode(e.x, e.y, def.color, e.type === 'gunner' ? 30 : 16);
-          if (Math.random() < (e.type === 'gunner' ? 0.5 : 0.07)) {
-            game.powerUps.push({ x: e.x, y: e.y, r: 10, age: 0 });
-          }
-        }
+        damageEnemy(e, b.dmg);
         break;
       }
     }
@@ -408,11 +563,12 @@ function update(dt) {
   }
 
   const inside = (b) => !b.dead && b.x > -20 && b.x < W + 20 && b.y > -20 && b.y < H + 20;
-  game.bullets = game.bullets.filter(inside);
+  // ホーミング弾が画面内を回り続けないよう寿命を設ける
+  game.bullets = game.bullets.filter((b) => inside(b) && b.age < 3);
   game.enemyBullets = game.enemyBullets.filter(inside);
   game.enemies = game.enemies.filter((e) => e.hp > 0);
 
-  updatePowerUps(dt);
+  updateItems(dt);
   updateParticles(dt);
 }
 
@@ -432,7 +588,7 @@ function drawShip(p) {
   ctx.lineTo(5, 12);
   ctx.fill();
 
-  ctx.fillStyle = p.power > 0 ? '#7fffb2' : '#6cf';
+  ctx.fillStyle = '#6cf';
   ctx.beginPath();
   ctx.moveTo(0, -18);
   ctx.lineTo(14, 14);
@@ -441,7 +597,8 @@ function drawShip(p) {
   ctx.closePath();
   ctx.fill();
 
-  ctx.fillStyle = '#fff';
+  // コックピットの色で今の武器がわかる
+  ctx.fillStyle = WEAPONS[p.weapon].color;
   ctx.beginPath();
   ctx.arc(0, -2, 3.5, 0, Math.PI * 2);
   ctx.fill();
@@ -507,10 +664,108 @@ function drawHud() {
     ctx.closePath();
     ctx.fill();
   }
-  if (p.power > 0) {
-    ctx.fillStyle = '#7fffb2';
-    ctx.fillRect(W - 14 - p.power * 12, 44, p.power * 12, 6);
+
+  // 武器名とレベル
+  const w = WEAPONS[p.weapon];
+  ctx.fillStyle = w.color;
+  ctx.font = 'bold 15px system-ui, sans-serif';
+  ctx.textAlign = 'right';
+  ctx.fillText(w.name, W - 14 - MAX_LEVEL * 12, 56);
+  for (let i = 0; i < MAX_LEVEL; i++) {
+    ctx.fillStyle = i < p.level ? w.color : 'rgba(255,255,255,0.2)';
+    ctx.fillRect(W - 14 - (MAX_LEVEL - i) * 12 + 3, 46, 8, 10);
   }
+
+  // ボムボタン(残り数を表示)。キーボードでは X / B
+  const bb = BOMB_BUTTON;
+  const ready = p.bombs > 0 && game.bombFx <= 0;
+  ctx.globalAlpha = ready ? 0.9 : 0.35;
+  ctx.strokeStyle = BOMB_ITEM_COLOR;
+  ctx.lineWidth = 3;
+  ctx.fillStyle = 'rgba(255,84,112,0.18)';
+  ctx.beginPath();
+  ctx.arc(bb.x, bb.y, bb.r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = '#fff';
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 14px system-ui, sans-serif';
+  ctx.fillText('BOMB', bb.x, bb.y - 2);
+  ctx.font = 'bold 16px system-ui, sans-serif';
+  ctx.fillText(`×${p.bombs}`, bb.x, bb.y + 16);
+  ctx.globalAlpha = 1;
+}
+
+function drawBullet(b) {
+  const color = WEAPONS[b.kind].color;
+  ctx.fillStyle = color;
+  switch (b.kind) {
+    case 'normal':
+      ctx.fillRect(b.x - 2, b.y - 8, 4, 14);
+      break;
+    case 'spread':
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+      ctx.fill();
+      break;
+    case 'laser':
+      ctx.fillRect(b.x - 2, b.y - 22, 4, 36);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(b.x - 1, b.y - 22, 2, 36);
+      break;
+    case 'homing': {
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      ctx.rotate(Math.atan2(b.vy, b.vx));
+      ctx.fillRect(-7, -2.5, 12, 5);
+      ctx.fillStyle = '#ffb347';
+      ctx.fillRect(-10, -1.5, 3, 3);
+      ctx.restore();
+      break;
+    }
+    case 'wave':
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      ctx.ellipse(b.x, b.y, b.r + 3, b.r - 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      break;
+  }
+}
+
+function drawItem(u) {
+  const isBomb = u.kind === 'bomb';
+  const color = isBomb ? BOMB_ITEM_COLOR : WEAPONS[u.kind].color;
+  const r = u.r + Math.sin(u.age * 8) * 2;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  if (isBomb) {
+    ctx.arc(u.x, u.y, r, 0, Math.PI * 2);
+  } else {
+    // 武器アイテムはひし形
+    ctx.moveTo(u.x, u.y - r - 2);
+    ctx.lineTo(u.x + r, u.y);
+    ctx.lineTo(u.x, u.y + r + 2);
+    ctx.lineTo(u.x - r, u.y);
+    ctx.closePath();
+  }
+  ctx.fill();
+  ctx.fillStyle = '#05060f';
+  ctx.font = 'bold 12px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(isBomb ? 'B' : WEAPONS[u.kind].letter, u.x, u.y + 4);
+}
+
+function drawBombFx() {
+  if (game.bombFx <= 0) return;
+  const t = 1 - game.bombFx / 0.8; // 0 → 1
+  ctx.fillStyle = `rgba(255,255,255,${0.6 * (1 - t)})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = `rgba(255,120,150,${1 - t})`;
+  ctx.lineWidth = 14 * (1 - t) + 2;
+  ctx.beginPath();
+  ctx.arc(game.bombOrigin.x, game.bombOrigin.y, t * H * 1.1, 0, Math.PI * 2);
+  ctx.stroke();
 }
 
 function render() {
@@ -531,31 +786,30 @@ function render() {
     drawCenteredText('STAR BLASTER', H / 2 - 60, 44, '#6cf');
     drawCenteredText('移動: 矢印キー / WASD', H / 2, 18);
     drawCenteredText('ショット: スペース / Z', H / 2 + 28, 18);
-    drawCenteredText('一時停止: P', H / 2 + 56, 18);
-    drawCenteredText('スマホ: 画面をドラッグ', H / 2 + 84, 18);
+    drawCenteredText('ボム: X / B', H / 2 + 56, 18);
+    drawCenteredText('一時停止: P', H / 2 + 84, 18);
+    drawCenteredText('スマホ: ドラッグで移動・BOMBボタン', H / 2 + 112, 18);
+    drawCenteredText('◆アイテムで武器チェンジ / 同じ武器でレベルアップ', H / 2 + 148, 15, '#aaa');
+    WEAPON_IDS.forEach((id, i) => {
+      const w = WEAPONS[id];
+      ctx.fillStyle = w.color;
+      ctx.font = 'bold 13px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(w.name, W / 2 + (i - 2) * 86, H / 2 + 172);
+    });
     if (Math.floor(performance.now() / 500) % 2 === 0) {
-      drawCenteredText('ENTER / タップでスタート', H / 2 + 150, 22, '#ffb347');
+      drawCenteredText('ENTER / タップでスタート', H / 2 + 225, 22, '#ffb347');
     }
     if (game.highScore > 0) drawCenteredText(`HIGH SCORE ${game.highScore}`, H - 40, 16, '#aaa');
     ctx.restore();
     return;
   }
 
-  for (const u of game.powerUps) {
-    ctx.fillStyle = '#7fffb2';
-    ctx.beginPath();
-    ctx.arc(u.x, u.y, u.r + Math.sin(u.age * 8) * 2, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#05060f';
-    ctx.font = 'bold 12px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('P', u.x, u.y + 4);
-  }
+  for (const u of game.items) drawItem(u);
 
   for (const e of game.enemies) drawEnemy(e);
 
-  ctx.fillStyle = '#fff6a0';
-  for (const b of game.bullets) ctx.fillRect(b.x - 2, b.y - 8, 4, 14);
+  for (const b of game.bullets) drawBullet(b);
 
   ctx.fillStyle = '#ff6b9a';
   for (const b of game.enemyBullets) {
@@ -573,6 +827,7 @@ function render() {
   }
   ctx.globalAlpha = 1;
 
+  drawBombFx();
   drawHud();
 
   if (game.state === 'paused') {
